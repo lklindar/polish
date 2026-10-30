@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { drawCaption } from '../core/captionRender';
 import { captionAt } from '../core/captions';
+import { frameState } from '../core/compose';
+import { webcamAt } from '../core/layout';
 import { editStats } from '../core/edl';
 import { fmtDuration } from '../core/format';
 import { EdlPlayer } from '../player/EdlPlayer';
@@ -18,12 +20,18 @@ export function Editor() {
   const [player, setPlayer] = useState<EdlPlayer | null>(null);
   useEffect(() => {
     const p = new EdlPlayer(fileUrl);
-    // Captions are drawn from the store on every frame, in source time (After mode only).
+    // Zoom and captions come from the store on every frame, in source time (After mode only).
+    p.compose = (t) => {
+      const { edl, settings, mode } = useStore.getState();
+      return edl && mode === 'after' ? frameState(edl, settings.zoom, t) : null;
+    };
     p.overlay = (ctx, t, w, h) => {
       const { edl, settings, mode } = useStore.getState();
-      if (!edl || mode === 'before' || !settings.captions.burnIn) return;
+      if (!edl || mode === 'before' || !settings.captions.enabled) return false;
       const cap = captionAt(edl.captions, t);
-      if (cap) drawCaption(ctx, cap, t, settings.captions, w, h);
+      if (!cap) return false;
+      drawCaption(ctx, cap, t, settings.captions, w, h, edl.layout ? webcamAt(edl.layout.webcam, t) : null);
+      return true;
     };
     setPlayer(p);
     if (import.meta.env.DEV) (globalThis as unknown as { __player: EdlPlayer }).__player = p;
@@ -33,9 +41,7 @@ export function Editor() {
   const edl = useStore((s) => s.edl)!;
   const mode = useStore((s) => s.mode);
   useEffect(() => player?.setSegments(edl.segments), [player, edl.segments]);
-  useEffect(() => {
-    if (player) player.globalSpeed = edl.globalSpeed;
-  }, [player, edl.globalSpeed]);
+  useEffect(() => player?.setGlobalSpeed(edl.globalSpeed), [player, edl.globalSpeed]);
   useEffect(() => player?.setBypass(mode === 'before'), [player, mode]);
 
   if (!player) return null;
@@ -100,7 +106,7 @@ function Shell() {
         <div className="text-xs text-zinc-400 ml-2 hidden lg:block" title={`Analysis took ${(analysisMs / 1000).toFixed(1)}s`}>
           <span className="text-zinc-200 font-medium">{fmtDuration(stats.sourceSec)} → {fmtDuration(stats.outputSec)}</span>
           <span className="text-zinc-500">
-            {' '}· removed {fmtDuration(stats.removedSec)} ({Math.round((stats.removedSec / stats.sourceSec) * 100)}%): {stats.silences} silences, {stats.fillers} fillers
+            {' '}· removed {fmtDuration(stats.removedSec)} ({Math.round((stats.removedSec / stats.sourceSec) * 100)}%): {stats.silences} silences, {stats.fillers} fillers, {stats.repeats} repeats, {stats.zooms} zooms
             {stats.speedups > 0 && `, ${stats.speedups} speed-ups`}
           </span>
           {restoredProject && <span className="ml-2 text-accent-2/80">· restored autosave</span>}

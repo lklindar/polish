@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { acousticFillers, findRepeats, planFillerCuts, refineFiller, transcriptFillers, DEFAULT_LEXICON, DEFAULT_SOFT_LEXICON, type FillerSettings } from '../src/core/fillers';
+import { acousticFillers, closeGaps, findRepeats, heldWordCuts, planFillerCuts, refineFiller, repeatCuts, transcriptFillers, DEFAULT_LEXICON, DEFAULT_SOFT_LEXICON, type FillerSettings } from '../src/core/fillers';
 import { adaptiveLevels, smoothedDb, FRAME_SEC, type AudioAnalysis } from '../src/core/silence';
 import type { Word } from '../src/core/transcript';
 
 const W = (w: string, t0: number, t1: number): Word => ({ w, t0, t1 });
-const settings: FillerSettings = { enabled: true, minConfidence: 0.6, lexicon: DEFAULT_LEXICON, softLexicon: DEFAULT_SOFT_LEXICON, acoustic: true, paddingSec: 0.03 };
+const settings: FillerSettings = { enabled: true, minConfidence: 0.6, lexicon: DEFAULT_LEXICON, softLexicon: DEFAULT_SOFT_LEXICON, acoustic: true, paddingSec: 0.03, removeRepeats: true, trimHeldWords: true };
 
 /** Synthetic analysis: segments of [sec, kind] where kind = speech | vowel (held, steady) | pause. */
 function synth(pattern: [number, 'speech' | 'vowel' | 'pause'][]): AudioAnalysis {
@@ -141,5 +141,58 @@ describe('findRepeats', () => {
   it('ignores a phrase repeated later with other speech in between', () => {
     const words = 'we click the button and the page opens then we click the button again'.split(' ').map((w, i) => W(w, i * 0.3, i * 0.3 + 0.25));
     expect(findRepeats(words, [])).toHaveLength(0);
+  });
+});
+
+describe('repeats, held words, gap closing', () => {
+  // Levels per 20 ms frame: speech -30 dB, pause -65 dB.
+  const level = (spans: [number, number, number][], total: number): AudioAnalysis => {
+    const n = Math.round(total / FRAME_SEC);
+    const db = new Array(n).fill(-65);
+    for (const [a, b, d] of spans) for (let i = Math.round(a / FRAME_SEC); i < Math.round(b / FRAME_SEC); i++) db[i] = d;
+    const rms = Float32Array.from(db.map((d) => 10 ** (d / 20)));
+    return { frameSec: FRAME_SEC, rms, peak: rms, sampleRate: 16000, channels: 1, voicing: Float32Array.from(db.map((d) => (d > -50 ? 0.9 : 0.1))) };
+  };
+
+  it('cuts the first of two repeated words at the quiet point before the retake', () => {
+    // "the [gap] the demo": the1 0.50–0.70, quiet 0.70–0.80, the2 0.80–1.00, demo 1.00–1.50
+    const a = level([[0.5, 0.7, -30], [0.8, 1.0, -30], [1.0, 1.5, -28]], 2);
+    const ws = [W('So', 0.1, 0.4), W('the,', 0.5, 0.72), W('the', 0.8, 1.0), W('demo', 1.0, 1.5)];
+    const cuts = repeatCuts(ws, a, []);
+    expect(cuts).toHaveLength(1);
+    expect(cuts[0].enabled).toBe(true);
+    expect(cuts[0].start).toBeGreaterThan(0.38);
+    expect(cuts[0].start).toBeLessThanOrEqual(0.5);
+    expect(cuts[0].end).toBeGreaterThanOrEqual(0.7);
+    expect(cuts[0].end).toBeLessThanOrEqual(0.8);
+  });
+
+  it('cuts two-word repeats and leaves grammatical "that that" for review', () => {
+    const a = level([[0, 3, -30]], 3);
+    const ws = ['we', 'can', 'we', 'can', 'go', 'that', 'that', 'works'].map((w, i) => W(w, i * 0.3, i * 0.3 + 0.25));
+    const cuts = repeatCuts(ws, a, []);
+    expect(cuts.map((c) => [c.label, c.enabled])).toEqual([
+      ['we can (repeat)', true],
+      ['that (repeat)', false],
+    ]);
+  });
+
+  it('trims a drawn-out "a" to its first ~0.14 s and leaves a normal one alone', () => {
+    // "in a……… way": "a" vowel held 1.00–1.70; then "way". And a normal "a" at 3.0–3.12.
+    const a = level([[0.6, 0.85, -30], [1.0, 1.7, -31], [1.75, 2.1, -29], [3.0, 3.12, -31], [3.15, 3.5, -29]], 4);
+    const ws = [W('in', 0.6, 0.85), W('a', 1.0, 1.7), W('way', 1.75, 2.1), W('a', 3.0, 3.12), W('box', 3.15, 3.5)];
+    const cuts = heldWordCuts(ws, a);
+    expect(cuts).toHaveLength(1);
+    expect(cuts[0].start).toBeCloseTo(1.14, 1);
+    expect(cuts[0].end).toBeCloseTo(1.7, 1);
+  });
+
+  it('closes the pauses either side of a removed filler down to the padding', () => {
+    const pauses = [{ start: 1.0, end: 1.4 }, { start: 1.8, end: 2.3 }];
+    const [c] = closeGaps([{ start: 1.4, end: 1.8, type: 'filler', enabled: true }], pauses, 0.1);
+    expect(c.start).toBeCloseTo(1.1);
+    expect(c.end).toBeCloseTo(2.2);
+    // Disabled (kept) fillers aren't touched.
+    expect(closeGaps([{ start: 1.4, end: 1.8, type: 'filler', enabled: false }], pauses, 0.1)[0].start).toBe(1.4);
   });
 });

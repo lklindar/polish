@@ -1,6 +1,8 @@
 // Edit Decision List: the single source of truth for an edit. Nothing is re-encoded until export.
 
-export type CutType = 'silence' | 'filler' | 'manual' | 'deadStartEnd';
+import type { Layout } from './layout';
+
+export type CutType = 'silence' | 'filler' | 'repeat' | 'manual' | 'deadStartEnd';
 
 export interface Cut {
   start: number;
@@ -40,6 +42,7 @@ export interface Click {
   x: number;
   y: number;
   confidence: number;
+  reason?: string;
 }
 
 export interface Caption {
@@ -65,6 +68,10 @@ export interface EDL {
   globalSpeed: number;
   /** Source of truth for captions; caption edits rewrite these words. */
   transcript?: { words: { w: string; t0: number; t1: number }[]; language: string; model: string; device: string };
+  /** Auto zooms the user deleted; re-planning won't recreate zooms overlapping these. */
+  dismissedZooms?: { start: number; end: number }[];
+  /** Window rect, corner radius and webcam bubble spans (source px), from frame analysis. */
+  layout?: Layout;
   /** False starts / retakes, offered for review, never cut automatically. */
   suggestions?: { start: number; end: number; text: string }[];
 }
@@ -230,6 +237,7 @@ export function editStats(edl: EDL) {
     removedSec: edl.source.durationSec - out,
     silences: enabled.filter((c) => c.type === 'silence').length,
     fillers: enabled.filter((c) => c.type === 'filler').length,
+    repeats: enabled.filter((c) => c.type === 'repeat').length,
     manual: enabled.filter((c) => c.type === 'manual').length,
     speedups: edl.speedups.filter((s) => s.enabled).length,
     zooms: edl.zooms.length,

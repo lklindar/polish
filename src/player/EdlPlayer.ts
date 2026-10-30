@@ -4,6 +4,7 @@
 // which later milestones use for zoom, captions and ripples.
 
 import { nextSegmentIndex, segmentIndexAt, type Segment } from '../core/edl';
+import { Compositor, type FrameState } from '../render/compositor';
 
 const EPS = 1 / 120;
 
@@ -16,6 +17,9 @@ export class EdlPlayer {
   private raf = 0;
   private timer: ReturnType<typeof setInterval>;
   private ctx: CanvasRenderingContext2D | null = null;
+  private gl: Compositor | null = null;
+  private ov: OffscreenCanvas | null = null;
+  private ovCtx: OffscreenCanvasRenderingContext2D | null = null;
   private listeners = new Set<() => void>();
   /** Before mode: plays the raw source, ignoring the EDL. */
   bypass = false;
@@ -23,8 +27,12 @@ export class EdlPlayer {
   /** J/K/L shuttle multiplier. */
   shuttle = 1;
   playing = false;
-  /** Drawn on top of each frame (captions, later zoom/ripples). Gets source time. */
-  overlay: ((ctx: CanvasRenderingContext2D, srcTime: number, width: number, height: number) => void) | null = null;
+  /** Camera/webcam/ripple state for a source time (null = plain frame). */
+  compose: ((srcTime: number) => FrameState | null) | null = null;
+  /** Draws 2D overlays (captions) for a source time; returns false when there's nothing to draw. */
+  overlay:
+    | ((ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, srcTime: number, width: number, height: number) => boolean)
+    | null = null;
   /** Pause automatically when source time reaches this (used to audition a single edit). */
   private stopAt: number | null = null;
 
@@ -46,8 +54,16 @@ export class EdlPlayer {
     return v;
   }
 
+  /** WebGL2 compositor when available (zoom, blur, ripples); plain 2D drawing otherwise. */
   attachCanvas(canvas: HTMLCanvasElement | null) {
-    this.ctx = canvas?.getContext('2d', { alpha: false }) ?? null;
+    this.gl = null;
+    this.ctx = null;
+    if (!canvas) return;
+    try {
+      this.gl = new Compositor(canvas);
+    } catch {
+      this.ctx = canvas.getContext('2d', { alpha: false });
+    }
   }
 
   subscribe(fn: () => void) {
@@ -74,6 +90,11 @@ export class EdlPlayer {
   setSegments(segments: Segment[]) {
     this.segments = segments;
     this.syncToTime(this.srcTime);
+  }
+
+  setGlobalSpeed(speed: number) {
+    this.globalSpeed = speed;
+    this.applyRate();
   }
 
   setBypass(b: boolean) {
@@ -144,7 +165,8 @@ export class EdlPlayer {
     const seg = this.segments[this.segIdx];
     const segSpeed = this.bypass || !seg ? 1 : seg.speed;
     const v = this.video;
-    v.playbackRate = Math.min(16, segSpeed * this.globalSpeed * this.shuttle);
+    // Before mode plays the untouched original, so no global speed either.
+    v.playbackRate = Math.min(16, segSpeed * (this.bypass ? 1 : this.globalSpeed) * this.shuttle);
     v.muted = !this.bypass && seg?.reason === 'speedup';
   }
 
@@ -216,15 +238,35 @@ export class EdlPlayer {
     this.raf = requestAnimationFrame(this.loop);
     this.check();
     const v = this.video;
-    const ctx = this.ctx;
-    if (ctx && v.readyState >= 2) {
-      const c = ctx.canvas;
-      if (c.width !== v.videoWidth || c.height !== v.videoHeight) {
-        c.width = v.videoWidth;
-        c.height = v.videoHeight;
+    if (v.readyState < 2) return;
+    const W = v.videoWidth;
+    const H = v.videoHeight;
+    const t = v.currentTime;
+    if (this.gl) {
+      const c = this.gl.canvas;
+      if (c.width !== W || c.height !== H) {
+        c.width = W;
+        c.height = H;
       }
-      ctx.drawImage(v, 0, 0, c.width, c.height);
-      this.overlay?.(ctx, v.currentTime, c.width, c.height);
+      if (!this.ov || this.ov.width !== W || this.ov.height !== H) {
+        this.ov = new OffscreenCanvas(W, H);
+        this.ovCtx = this.ov.getContext('2d');
+      }
+      let drawn = false;
+      if (this.overlay && this.ovCtx) {
+        this.ovCtx.clearRect(0, 0, W, H);
+        drawn = this.overlay(this.ovCtx, t, W, H);
+      }
+      const state = this.compose?.(t) ?? null;
+      this.gl.render(v, W, H, state ?? plainState(W, H), drawn ? this.ov : null);
+    } else if (this.ctx) {
+      const c = this.ctx.canvas;
+      if (c.width !== W || c.height !== H) {
+        c.width = W;
+        c.height = H;
+      }
+      this.ctx.drawImage(v, 0, 0, W, H);
+      this.overlay?.(this.ctx, t, W, H);
     }
   }
 
@@ -238,4 +280,8 @@ export class EdlPlayer {
     });
     this.listeners.clear();
   }
+}
+
+function plainState(w: number, h: number): FrameState {
+  return { camera: { scale: 1, cx: w / 2, cy: h / 2 }, blur: { x: 0, y: 0 }, content: { x: 0, y: 0, w, h }, radius: 0, webcam: null, ripples: [] };
 }

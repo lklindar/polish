@@ -19,8 +19,12 @@ import {
   type StreamTargetChunk,
 } from 'mediabunny';
 import { AudioAssembler } from '../core/audioAssembler';
+import { TimeStretcher } from '../core/timeStretch';
 import { drawCaption } from '../core/captionRender';
 import { captionAt } from '../core/captions';
+import { frameState } from '../core/compose';
+import { webcamAt } from '../core/layout';
+import { Compositor } from '../render/compositor';
 import { measureEncoderDelay } from './encoderDelay';
 import { segmentOutStarts } from '../core/edl';
 import { outputSize } from '../core/settings';
@@ -111,9 +115,15 @@ async function run(msg: ExportIn) {
     };
 
     const videoJob = async () => {
+      // Same WebGL2 compositor as the preview: zoom, motion blur, webcam redraw, ripples,
+      // captions as an overlay texture.
       const canvas = new OffscreenCanvas(size.width, size.height);
-      const ctx = canvas.getContext('2d', { alpha: false })!;
-      ctx.imageSmoothingQuality = 'high';
+      const gl = new Compositor(canvas);
+      const overlay = new OffscreenCanvas(size.width, size.height);
+      const octx = overlay.getContext('2d')!;
+      const k = size.width / edl.source.width;
+      const srcW = vTrack.displayWidth;
+      const srcH = vTrack.displayHeight;
       const segs = edl.segments;
       const starts = segmentOutStarts(segs);
       const dt = 1 / fps;
@@ -135,11 +145,19 @@ async function run(msg: ExportIn) {
           if (ts < seg.srcStart - 1e-4) continue;
           const outT = (starts[si] + (ts - seg.srcStart) / seg.speed) / edl.globalSpeed;
           if (outT + dt / 2 < nextGrid) continue; // dropped by a speed-up
-          sample.draw(ctx, 0, 0, size.width, size.height);
+          let drawn = false;
           if (msg.captionStyle) {
             const cap = captionAt(edl.captions, ts);
-            if (cap) drawCaption(ctx, cap, ts, msg.captionStyle, size.width, size.height);
+            if (cap) {
+              octx.clearRect(0, 0, size.width, size.height);
+              const cam = edl.layout ? webcamAt(edl.layout.webcam, ts) : null;
+              drawCaption(octx, cap, ts, msg.captionStyle, size.width, size.height, cam && { x: cam.x * k, y: cam.y * k, r: cam.r * k });
+              drawn = true;
+            }
           }
+          const vf = sample.toVideoFrame();
+          gl.render(vf, srcW, srcH, frameState(edl, msg.zoom, ts, fps), drawn ? overlay : null);
+          vf.close();
           while (nextGrid <= outT + dt / 2) {
             const frame = new VideoSample(canvas, { timestamp: nextGrid, duration: dt });
             await videoSource.add(frame);
@@ -176,7 +194,14 @@ async function run(msg: ExportIn) {
         fadeSec: settings.fadeMs / 1000,
         emit: async (rawPlanes) => {
           if (cancelled) throw new Cancelled();
-          let planes = rawPlanes;
+          await encode(stretcher.push(rawPlanes));
+        },
+      });
+      // Whole-video speed: time-stretch the assembled audio, pitch preserved.
+      const stretcher = new TimeStretcher(sr, ch, edl.globalSpeed);
+      async function encode(input: Float32Array[]) {
+          let planes = input;
+          if (planes[0].length === 0) return;
           if (skip > 0) {
             const drop = Math.min(skip, planes[0].length);
             planes = planes.map((p) => p.subarray(drop));
@@ -193,12 +218,11 @@ async function run(msg: ExportIn) {
             format: 'f32-planar',
             numberOfChannels: ch,
             sampleRate: sr,
-            timestamp: offset / sr / edl.globalSpeed,
+            timestamp: offset / sr,
           });
           await src.add(s);
           s.close();
-        },
-      });
+      }
       const sink = new AudioSampleSink(aTrack);
       const first = segs[0]?.srcStart ?? 0;
       const last = segs[segs.length - 1]?.srcEnd ?? 0;
@@ -220,9 +244,10 @@ async function run(msg: ExportIn) {
         }
       }
       await assembler.finish();
+      await encode(stretcher.flush());
       if (delayFrames > 0) {
         const pad = new Float32Array(delayFrames * ch);
-        const s = new AudioSample({ data: pad, format: 'f32-planar', numberOfChannels: ch, sampleRate: sr, timestamp: written / sr / edl.globalSpeed });
+        const s = new AudioSample({ data: pad, format: 'f32-planar', numberOfChannels: ch, sampleRate: sr, timestamp: written / sr });
         await src.add(s);
         s.close();
       }

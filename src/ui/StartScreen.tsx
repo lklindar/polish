@@ -4,7 +4,8 @@ import { PRESETS, cloneSettings, type PresetId } from '../core/settings';
 import { useStore, type Step } from '../state/store';
 
 export function StartScreen() {
-  const { file, phase, steps, error, caps, presetId } = useStore();
+  const { file, phase, steps, error, caps, presetId, settings } = useStore();
+  const captionsOn = settings.captions.enabled;
   const setFile = useStore((s) => s.setFile);
   const run = useStore((s) => s.runPipeline);
   const setSettings = useStore((s) => s.setSettings);
@@ -87,7 +88,17 @@ export function StartScreen() {
               {PRESETS[id].label}
             </button>
           ))}
-          <span className="text-xs text-zinc-500 ml-2">{presetId !== 'custom' && PRESETS[presetId].blurb}</span>
+          <span className="text-xs text-zinc-500 ml-2 flex-1">{presetId !== 'custom' && PRESETS[presetId].blurb}</span>
+          <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer select-none" title="Burn captions into the video. You can change this later with the CC button.">
+            <input
+              type="checkbox"
+              checked={captionsOn}
+              disabled={analyzing}
+              onChange={(e) => setSettings({ ...settings, captions: { ...settings.captions, enabled: e.target.checked } }, presetId)}
+              className="accent-[#8b7cff]"
+            />
+            Captions
+          </label>
         </div>
 
         <button

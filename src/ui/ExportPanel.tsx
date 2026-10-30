@@ -83,7 +83,8 @@ export function ExportPanel({ onClose }: { onClose: () => void }) {
       edl: edl!,
       settings: settings.export,
       fileName: file!.name,
-      captionStyle: settings.captions.burnIn && edl!.captions.length ? settings.captions : null,
+      captionStyle: settings.captions.enabled && edl!.captions.length ? settings.captions : null,
+      zoom: settings.zoom,
     };
     w.postMessage(msg);
   };
@@ -93,7 +94,7 @@ export function ExportPanel({ onClose }: { onClose: () => void }) {
   const report = [
     `Polish edit report: ${file!.name}`,
     `Source ${fmtDuration(stats.sourceSec)} → output ${fmtDuration(stats.outputSec)}`,
-    `Removed ${fmtDuration(stats.removedSec)} (${Math.round((stats.removedSec / stats.sourceSec) * 100)}%): ${stats.silences} silences, ${stats.fillers} fillers${stats.manual ? `, ${stats.manual} manual cuts` : ''}.`,
+    `Removed ${fmtDuration(stats.removedSec)} (${Math.round((stats.removedSec / stats.sourceSec) * 100)}%): ${stats.silences} silences, ${stats.fillers} fillers, ${stats.repeats} repeats${stats.manual ? `, ${stats.manual} manual cuts` : ''}.`,
     `Sped up ${stats.speedups} silent-but-busy stretches. Added ${stats.zooms} zooms.`,
   ].join('\n');
 
@@ -116,7 +117,8 @@ export function ExportPanel({ onClose }: { onClose: () => void }) {
         </div>
         <div className="text-sm text-zinc-400 mt-1">
           {size.width}×{size.height} · H.264 High · {settings.export.bitrateMbps} Mbps · AAC · {fmtTime(stats.outputSec)}
-          {settings.captions.burnIn && edl!.captions.length > 0 && ' · captions burned in'}
+          {settings.captions.enabled && edl!.captions.length > 0 ? ' · captions burned in' : ' · no captions'}
+          {edl!.globalSpeed !== 1 && ` · ${edl!.globalSpeed}× speed`}
         </div>
         <pre className="mt-4 text-xs text-zinc-400 bg-zinc-950 rounded-lg p-3 whitespace-pre-wrap">{report}</pre>
 
@@ -167,7 +169,7 @@ export function ExportPanel({ onClose }: { onClose: () => void }) {
               {edl!.captions.length > 0 && (
                 <>
                   <TextDownload text={toSrt(edl!.captions, edl!.segments, edl!.globalSpeed)} name={`${baseName} (polished).srt`} label="Captions .srt" />
-                  <TextDownload text={toTranscriptText(edl!.captions, edl!.segments)} name={`${baseName} - transcript.txt`} label="Transcript" />
+                  <TextDownload text={toTranscriptText(edl!.captions, edl!.segments, edl!.globalSpeed)} name={`${baseName} - transcript.txt`} label="Transcript" />
                 </>
               )}
             </div>

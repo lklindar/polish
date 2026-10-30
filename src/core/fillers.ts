@@ -17,6 +17,10 @@ export interface FillerSettings {
   softLexicon: string;
   acoustic: boolean;
   paddingSec: number;
+  /** Cut stutters ("the, the") and false starts ("we can, we can"). */
+  removeRepeats: boolean;
+  /** Shorten hesitation-length short words ("a……", "the……") to a natural length. */
+  trimHeldWords: boolean;
 }
 
 export const DEFAULT_LEXICON = 'um, uh, uhm, er, erm, hmm, hm, mm, ah, eh, ehm, em';
@@ -224,7 +228,13 @@ export function acousticFillers(audio: AudioAnalysis, levels: Levels, words: Wor
     const before = Math.floor(start / f) - 1;
     const isolated = (before < 0 || db[Math.max(0, before - 3)] < levels.thresholdDb ? 0.5 : 0) + (j + 4 >= n || db[Math.min(n - 1, j + 4)] < levels.thresholdDb ? 0.5 : 0);
     const lengthScore = dur >= 0.25 && dur <= 0.9 ? 1 : 0.5;
-    const confidence = clamp01(0.4 * steady + 0.3 * smooth + 0.15 * isolated + 0.15 * lengthScore);
+    let confidence = clamp01(0.4 * steady + 0.3 * smooth + 0.15 * isolated + 0.15 * lengthScore);
+    // A fully voiced, flat-pitched "a…"/"uh…" between transcribed words is a hesitation Whisper
+    // dropped, even when it isn't separated by pauses.
+    let voicedFrames = 0;
+    for (let k = Math.floor(start / f); k <= j; k++) if (audio.voicing[k] > 0.55) voicedFrames++;
+    const voicedShare = voicedFrames / (j - Math.floor(start / f) + 1);
+    if (voicedShare >= 0.9 && sdSt <= 0.8 && dur >= 0.18 && dur <= 0.8) confidence = Math.max(confidence, 0.62);
     // Weak candidates would only clutter the review list.
     if (confidence >= 0.4) out.push({ start, end, text: '≈ held vowel', source: 'acoustic', confidence: round2(confidence) });
   }
@@ -262,6 +272,114 @@ export function planFillerCuts(audio: AudioAnalysis, levels: Levels, words: Word
       confidence: c.confidence,
       enabled: c.confidence >= s.minConfidence,
     }));
+}
+
+/**
+ * Where to join around a word: the quiet frame within [t - before, t + after] closest to t (any
+ * frame within 3 dB of the minimum counts as quiet), so neighbouring speech keeps its tail.
+ */
+function quietestNear(audio: AudioAnalysis, t: number, before: number, after: number): number {
+  const f = audio.frameSec;
+  const a = Math.max(0, Math.round((t - before) / f));
+  const b = Math.min(audio.rms.length - 1, Math.round((t + after) / f));
+  let min = Infinity;
+  for (let i = a; i <= b; i++) min = Math.min(min, audio.rms[i]);
+  const quiet = min * 10 ** (3 / 20);
+  const target = Math.round(t / f);
+  let best = a;
+  for (let i = a; i <= b; i++) if (audio.rms[i] <= quiet && Math.abs(i - target) < Math.abs(best - target)) best = i;
+  return best * f;
+}
+
+/**
+ * Repeated words: immediate stutters (1–3 words said twice in a row, "the, the", "we can, we
+ * can") and false starts (≥ 3 words re-said within 10 s, see findRepeats). The first attempt is
+ * cut from its quietest onset to the quietest point before the retake starts.
+ */
+export function repeatCuts(words: Word[], audio: AudioAnalysis, fillerCuts: Cut[]): Cut[] {
+  const isFiller = (w: Word) => fillerCuts.some((c) => c.enabled && (w.t0 + w.t1) / 2 >= c.start && (w.t0 + w.t1) / 2 < c.end);
+  const ws = words.filter((w) => !isFiller(w));
+  const norm = ws.map((w) => normWord(w.w));
+  const out: Cut[] = [];
+  const add = (i: number, j: number, text: string, confidence: number) => {
+    const start = quietestNear(audio, ws[i].t0, 0.12, 0.05);
+    const end = quietestNear(audio, ws[j].t0, 0.12, 0.03);
+    if (end - start < 0.08 || out.some((c) => c.start < end && start < c.end)) return;
+    out.push({ start, end, type: 'repeat', label: `${text} (repeat)`, confidence, enabled: true });
+  };
+  for (let i = 0; i < ws.length; i++) {
+    for (let n = 3; n >= 1; n--) {
+      if (i + 2 * n > ws.length) continue;
+      let same = true;
+      for (let k = 0; k < n; k++) if (!norm[i + k] || norm[i + k] !== norm[i + n + k]) same = false;
+      if (!same || ws[i + n].t0 - ws[i + n - 1].t1 > 1.0) continue;
+      // "that that" / "had had" are often grammatical: list them, but don't cut by default.
+      const grammatical = n === 1 && ['that', 'had', 'is', 'do'].includes(norm[i]);
+      add(i, i + n, ws.slice(i, i + n).map((w) => w.w).join(' '), grammatical ? 0.4 : 0.8);
+      i += n - 1;
+      break;
+    }
+  }
+  for (const r of findRepeats(words, fillerCuts.filter((c) => c.enabled))) {
+    const i = ws.findIndex((w) => w.t0 >= r.start - 1e-6);
+    const j = ws.findIndex((w) => w.t0 >= r.end - 1e-6);
+    if (i >= 0 && j > i) add(i, j, r.text.split(' ').slice(0, 4).join(' ') + '…', 0.7);
+  }
+  return out.map((c) => ({ ...c, enabled: (c.confidence ?? 0) >= 0.6 }));
+}
+
+/** Short words people stretch while thinking ("a……", "the……", "so……"). */
+const HOLDABLE = new Set(['a', 'the', 'and', 'so', 'to', 'of', 'i', 'in', 'e', 'ya', 'yang', 'itu', 'ini']);
+const HELD_MIN_SEC = 0.34; // normal short words stay under ~0.3 s; hesitations on the sample ran 0.34–0.7 s
+const HELD_KEEP_SEC = 0.14;
+
+/**
+ * Trims a drawn-out short word: keeps its first HELD_KEEP_SEC and cuts the rest of the held vowel
+ * up to the next word, so "a……… way" becomes "a way".
+ */
+export function heldWordCuts(words: Word[], audio: AudioAnalysis): Cut[] {
+  const f = audio.frameSec;
+  const n = audio.rms.length;
+  const db = (i: number) => 20 * Math.log10(Math.max(audio.rms[i], 1e-6));
+  const out: Cut[] = [];
+  words.forEach((w, k) => {
+    if (!HOLDABLE.has(normWord(w.w))) return;
+    const next = words[k + 1];
+    // Core = loudest frame in the first 60% of the word; extend while within 6 dB.
+    const a0 = Math.max(0, Math.round(w.t0 / f));
+    const a1 = Math.min(n - 1, Math.round((w.t0 + 0.6 * Math.max(0.05, w.t1 - w.t0)) / f));
+    let core = a0;
+    for (let i = a0; i <= a1; i++) if (db(i) > db(core)) core = i;
+    const coreDb = db(core);
+    let s = core;
+    while (s > 0 && db(s - 1) >= coreDb - 6) s--;
+    let e = core;
+    const limit = next ? Math.round((next.t0 + 0.05) / f) : n - 1;
+    while (e < Math.min(n - 1, limit) && db(e + 1) >= coreDb - 6) e++;
+    const len = (e - s + 1) * f;
+    if (len < HELD_MIN_SEC || s * f < w.t0 - 0.15) return;
+    const start = s * f + HELD_KEEP_SEC;
+    const end = (e + 1) * f;
+    if (end - start >= 0.1) out.push({ start, end, type: 'filler', label: `${w.w.replace(/[^\p{L}]/gu, '')}… (held)`, confidence: 0.7, enabled: true });
+  });
+  return out;
+}
+
+/**
+ * After a filler or repeat is cut, the pauses either side of it would join into one noticeable
+ * gap ("and… [um] …in"). Extend such cuts through the neighbouring pauses, keeping `pad` of
+ * silence next to the speech on each side.
+ */
+export function closeGaps(cuts: Cut[], pauses: { start: number; end: number }[], pad: number): Cut[] {
+  return cuts.map((c) => {
+    if (!c.enabled || (c.type !== 'filler' && c.type !== 'repeat')) return c;
+    let { start, end } = c;
+    const before = pauses.find((p) => p.end >= start - 0.08 && p.end <= start + 0.06);
+    if (before && before.start + pad < start) start = before.start + pad;
+    const after = pauses.find((p) => p.start >= end - 0.06 && p.start <= end + 0.08);
+    if (after && after.end - pad > end) end = after.end - pad;
+    return start === c.start && end === c.end ? c : { ...c, start, end };
+  });
 }
 
 export interface RepeatSuggestion {

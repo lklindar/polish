@@ -6,8 +6,8 @@ import { fmtTime } from './format';
 import type { Word } from './transcript';
 
 export interface CaptionSettings {
-  /** Burn captions into the exported video (the .srt is always available). */
-  burnIn: boolean;
+  /** Captions on/off: shown in the preview and burned into the export. The .srt is always offered. */
+  enabled: boolean;
   maxCharsPerLine: number;
   maxLines: number;
   highlightWord: boolean;
@@ -140,9 +140,9 @@ function srtTime(t: number): string {
 }
 
 /** Plain transcript of the edited video (output timestamps every caption). */
-export function toTranscriptText(captions: Caption[], segments: Segment[]): string {
+export function toTranscriptText(captions: Caption[], segments: Segment[], globalSpeed = 1): string {
   return captions
     .filter((c) => segmentIndexAt(segments, c.words[0]?.t0 ?? c.start) >= 0)
-    .map((c) => `[${fmtTime(srcToOut(segments, c.start))}] ${c.text.replace(/\n/g, ' ')}`)
+    .map((c) => `[${fmtTime(srcToOut(segments, c.start, globalSpeed))}] ${c.text.replace(/\n/g, ' ')}`)
     .join('\n');
 }

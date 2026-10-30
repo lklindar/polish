@@ -2,6 +2,7 @@
 
 import type { CaptionSettings } from './captions';
 import { DEFAULT_LEXICON, DEFAULT_SOFT_LEXICON, DISFLUENT_PROMPT, type FillerSettings } from './fillers';
+import type { ZoomSettings } from './zoom';
 
 export interface SilenceSettings {
   enabled: boolean;
@@ -37,6 +38,7 @@ export interface Settings {
   fillers: FillerSettings;
   transcription: TranscriptionSettings;
   captions: CaptionSettings;
+  zoom: ZoomSettings;
   export: ExportSettings;
 }
 
@@ -50,9 +52,12 @@ const baseFillers: FillerSettings = {
   softLexicon: DEFAULT_SOFT_LEXICON,
   acoustic: true,
   paddingSec: 0.03,
+  removeRepeats: true,
+  trimHeldWords: true,
 };
 const baseTranscription: TranscriptionSettings = { model: 'base', language: 'auto', prompt: DISFLUENT_PROMPT };
-const baseCaptions: CaptionSettings = { burnIn: true, maxCharsPerLine: 42, maxLines: 2, highlightWord: true, size: 0.042 };
+const baseZoom: ZoomSettings = { enabled: true, scale: 1.8, minConfidence: 0.55, followCursor: true, motionBlur: true, ripple: true };
+const baseCaptions: CaptionSettings = { enabled: true, maxCharsPerLine: 42, maxLines: 2, highlightWord: true, size: 0.042 };
 
 export const PRESETS: Record<PresetId, { label: string; blurb: string; settings: Settings }> = {
   clean: {
@@ -61,8 +66,8 @@ export const PRESETS: Record<PresetId, { label: string; blurb: string; settings:
     settings: {
       silence: {
         enabled: true,
-        minSilenceSec: 0.8,
-        paddingSec: 0.15,
+        minSilenceSec: 0.6,
+        paddingSec: 0.12,
         thresholdRatio: 0.35,
         speedUpBusy: false,
         minSpeed: 3,
@@ -72,7 +77,8 @@ export const PRESETS: Record<PresetId, { label: string; blurb: string; settings:
       },
       fillers: baseFillers,
       transcription: baseTranscription,
-      captions: { ...baseCaptions, burnIn: false },
+      captions: { ...baseCaptions, enabled: false },
+      zoom: { ...baseZoom, enabled: false },
       export: baseExport,
     },
   },
@@ -82,18 +88,19 @@ export const PRESETS: Record<PresetId, { label: string; blurb: string; settings:
     settings: {
       silence: {
         enabled: true,
-        minSilenceSec: 0.6,
-        paddingSec: 0.12,
-        thresholdRatio: 0.35,
+        minSilenceSec: 0.35,
+        paddingSec: 0.1,
+        thresholdRatio: 0.4,
         speedUpBusy: true,
         minSpeed: 3,
-        maxSpeed: 8,
-        speedUpTargetSec: 1.5,
+        maxSpeed: 12,
+        speedUpTargetSec: 0.8,
         trimDeadAir: true,
       },
       fillers: baseFillers,
       transcription: baseTranscription,
       captions: baseCaptions,
+      zoom: baseZoom,
       export: baseExport,
     },
   },
@@ -103,18 +110,19 @@ export const PRESETS: Record<PresetId, { label: string; blurb: string; settings:
     settings: {
       silence: {
         enabled: true,
-        minSilenceSec: 0.4,
-        paddingSec: 0.1,
-        thresholdRatio: 0.35,
+        minSilenceSec: 0.25,
+        paddingSec: 0.07,
+        thresholdRatio: 0.45,
         speedUpBusy: true,
         minSpeed: 4,
-        maxSpeed: 10,
-        speedUpTargetSec: 1,
+        maxSpeed: 16,
+        speedUpTargetSec: 0.5,
         trimDeadAir: true,
       },
       fillers: { ...baseFillers, minConfidence: 0.5 },
       transcription: baseTranscription,
       captions: { ...baseCaptions, maxCharsPerLine: 32, size: 0.05 },
+      zoom: { ...baseZoom, scale: 2, minConfidence: 0.45 },
       export: baseExport,
     },
   },

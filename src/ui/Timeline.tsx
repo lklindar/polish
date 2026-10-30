@@ -1,8 +1,11 @@
 // Multi-track timeline on a single canvas, in source time: ruler, waveform with cut overlays, an
-// edits track (gray = silence, blue = speed-up, yellow = filler, violet = manual) and captions.
+// edits track (gray = silence, blue = speed-up, yellow = filler, violet = manual), captions, zoom
+// blocks (drag to move, drag an edge to resize) and inferred clicks.
 
-import { useEffect, useMemo, useRef } from 'react';
-import type { Cut, EDL } from '../core/edl';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ScrubPreview } from './ScrubPreview';
+import { HoverFrames } from '../player/HoverFrames';
+import type { Cut, EDL, ZoomBlock } from '../core/edl';
 import { fmtTime } from '../core/format';
 import { useStore, type Selection } from '../state/store';
 import { usePlayer } from './playerContext';
@@ -14,12 +17,18 @@ const EDITS_Y = WAVE_Y + WAVE_H + 6;
 const EDITS_H = 22;
 const CAPS_Y = EDITS_Y + EDITS_H + 6;
 const CAPS_H = 20;
-const HEIGHT = CAPS_Y + CAPS_H + 10;
+const ZOOM_Y = CAPS_Y + CAPS_H + 6;
+const ZOOM_H = 22;
+const CLICKS_Y = ZOOM_Y + ZOOM_H + 6;
+const CLICKS_H = 14;
+const HEIGHT = CLICKS_Y + CLICKS_H + 8;
+const ZOOM_COLOR = '#22c55e';
 const LABEL_W = 64;
 
 export const CUT_COLORS: Record<Cut['type'] | 'speedup', string> = {
   silence: '#71717a',
   filler: '#eab308',
+  repeat: '#f97316',
   manual: '#a78bfa',
   deadStartEnd: '#52525b',
   speedup: '#38bdf8',
@@ -35,8 +44,26 @@ export function Timeline() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const view = useRef<View>({ pxPerSec: 0, scroll: 0 });
-  const drag = useRef<{ kind: 'scrub' | 'range'; x0: number; t0: number; moved: boolean } | null>(null);
+  const drag = useRef<
+    | { kind: 'scrub' | 'range'; x0: number; t0: number; moved: boolean }
+    | { kind: 'zoom'; mode: 'move' | 'start' | 'end'; index: number; x0: number; t0: number; orig: ZoomBlock; moved: boolean }
+    | null
+  >(null);
   const audio = useStore((s) => s.audio);
+  const [hover, setHover] = useState<{ t: number; x: number; w: number } | null>(null);
+  // One hidden video for hover previews, kept loaded for the whole editing session.
+  const fileUrl = useStore((s) => s.fileUrl)!;
+  const live = useMemo(() => new HoverFrames(fileUrl), [fileUrl]);
+  useEffect(() => () => live.destroy(), [live]);
+  const hoverRaf = useRef(0);
+  const trackHover = (e: React.PointerEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    cancelAnimationFrame(hoverRaf.current);
+    if (x < LABEL_W) return setHover(null);
+    const t = Math.min(useStore.getState().edl!.source.durationSec, Math.max(0, timeAt(x)));
+    hoverRaf.current = requestAnimationFrame(() => setHover({ t, x, w: rect.width }));
+  };
 
   // Normalize the waveform to the file's own loudness (the sample peaks at −8 dB).
   const norm = useMemo(() => {
@@ -118,7 +145,7 @@ export function Timeline() {
       } else if (hit) {
         const edl = store.edl!;
         const item = hit.kind === 'cut' ? edl.cuts[hit.index] : hit.kind === 'speedup' ? edl.speedups[hit.index] : null;
-        if (item && hit.kind === 'cut' && edl.cuts[hit.index].type === 'filler') {
+        if (item && hit.kind === 'cut' && (edl.cuts[hit.index].type === 'filler' || edl.cuts[hit.index].type === 'repeat')) {
           // Audition the filler in the original, with a little context on each side.
           store.setMode('before');
           player.playSpan(Math.max(0, item.start - 0.6), item.end + 0.4);
@@ -127,6 +154,31 @@ export function Timeline() {
           player.seek(Math.max(0, item.start - 1));
         }
       }
+      return;
+    }
+    if (y >= ZOOM_Y - 2 && y <= ZOOM_Y + ZOOM_H + 2) {
+      const t = timeAt(x);
+      const edl = store.edl!;
+      const index = edl.zooms.findIndex((z) => t >= z.start - 4 / view.current.pxPerSec && t <= z.end + 4 / view.current.pxPerSec);
+      if (index < 0) {
+        store.setSelection(null);
+        player.seek(t);
+        return;
+      }
+      const z = edl.zooms[index];
+      const edgePx = 6;
+      const X = (tt: number) => LABEL_W + (tt - view.current.scroll) * view.current.pxPerSec;
+      const mode = Math.abs(x - X(z.start)) <= edgePx ? 'start' : Math.abs(x - X(z.end)) <= edgePx ? 'end' : 'move';
+      store.setSelection({ kind: 'zoom', index });
+      (e.target as Element).setPointerCapture(e.pointerId);
+      drag.current = { kind: 'zoom', mode, index, x0: x, t0: t, orig: z, moved: false };
+      return;
+    }
+    if (y >= CLICKS_Y - 2 && y <= CLICKS_Y + CLICKS_H + 2) {
+      const t = timeAt(x);
+      const tol = 5 / view.current.pxPerSec;
+      const c = store.edl!.clicks.find((k) => Math.abs(k.t - t) <= tol);
+      player.seek(Math.max(0, (c?.t ?? t) - (c ? 0.6 : 0)));
       return;
     }
     if (y >= CAPS_Y - 2 && y <= CAPS_Y + CAPS_H + 2) {
@@ -143,11 +195,32 @@ export function Timeline() {
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    trackHover(e);
     const d = drag.current;
     if (!d) return;
     const x = e.clientX - canvasRef.current!.getBoundingClientRect().left;
     if (Math.abs(x - d.x0) > 3) d.moved = true;
     const t = Math.max(0, timeAt(x));
+    if (d.kind === 'zoom') {
+      if (!d.moved) return;
+      const store = useStore.getState();
+      const zs = store.edl!.zooms;
+      const prevEnd = d.index > 0 ? zs[d.index - 1].end : 0;
+      const nextStart = d.index < zs.length - 1 ? zs[d.index + 1].start : store.edl!.source.durationSec;
+      const o = d.orig;
+      let start = o.start;
+      let end = o.end;
+      const dt = t - d.t0;
+      if (d.mode === 'move') {
+        const len = o.end - o.start;
+        start = Math.min(nextStart - len, Math.max(prevEnd, o.start + dt));
+        end = start + len;
+      } else if (d.mode === 'start') start = Math.min(o.end - 1, Math.max(prevEnd, o.start + dt));
+      else end = Math.max(o.start + 1, Math.min(nextStart, o.end + dt));
+      const shift = d.mode === 'move' ? start - o.start : 0;
+      store.updateZoom(d.index, { start, end, focus: o.focus.map((f) => ({ ...f, t: f.t + shift })) }, 'zoom-drag');
+      return;
+    }
     if (d.kind === 'scrub') player.seek(t);
     else if (d.moved) useStore.getState().setSelection({ kind: 'range', start: Math.min(d.t0, t), end: Math.max(d.t0, t) });
   };
@@ -177,15 +250,20 @@ export function Timeline() {
   };
 
   return (
-    <div ref={wrapRef} className="shrink-0 border-t border-zinc-800/80 select-none" style={{ background: '#0c0c0e' }}>
+    <div ref={wrapRef} className="relative shrink-0 border-t border-zinc-800/80 select-none" style={{ background: '#0c0c0e' }}>
       <canvas
         ref={canvasRef}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onWheel={onWheel}
+        onPointerLeave={() => {
+          cancelAnimationFrame(hoverRaf.current);
+          setHover(null);
+        }}
         className="block cursor-crosshair"
       />
+      {hover && <ScrubPreview t={hover.t} x={hover.x} containerWidth={hover.w} live={live} />}
     </div>
   );
 }
@@ -215,6 +293,8 @@ function drawTimeline(
   ctx.fillText('AUDIO', 10, WAVE_Y + WAVE_H / 2 + 3);
   ctx.fillText('EDITS', 10, EDITS_Y + EDITS_H / 2 + 3);
   ctx.fillText('CAPTIONS', 10, CAPS_Y + CAPS_H / 2 + 3);
+  ctx.fillText('ZOOM', 10, ZOOM_Y + ZOOM_H / 2 + 3);
+  ctx.fillText('CLICKS', 10, CLICKS_Y + CLICKS_H / 2 + 3);
 
   ctx.save();
   ctx.beginPath();
@@ -286,7 +366,8 @@ function drawTimeline(
     }
   };
   // Fillers last so they sit on top of the silences around them.
-  const order = edl.cuts.map((_, i) => i).sort((a, b) => Number(edl.cuts[a].type === 'filler') - Number(edl.cuts[b].type === 'filler'));
+  const onTop = (c: Cut) => Number(c.type === 'filler' || c.type === 'repeat');
+  const order = edl.cuts.map((_, i) => i).sort((a, b) => onTop(edl.cuts[a]) - onTop(edl.cuts[b]));
   for (const i of order) {
     const c = edl.cuts[i];
     drawItem(c.start, c.end, CUT_COLORS[c.type], c.enabled, selection?.kind === 'cut' && selection.index === i, c.label);
@@ -313,6 +394,45 @@ function drawTimeline(
     }
     drawItem(s.start, s.end, CUT_COLORS.speedup, s.enabled, selection?.kind === 'speedup' && selection.index === i, `⏩ ${s.speed}×`);
   });
+
+  // Zoom blocks, with the zoom-in/out ramps shaded.
+  edl.zooms.forEach((z, i) => {
+    if (z.end < t0 || z.start > t1) return;
+    const xa = X(z.start);
+    const w = Math.max(3, (z.end - z.start) * v.pxPerSec);
+    const sel = selection?.kind === 'zoom' && selection.index === i;
+    ctx.globalAlpha = z.source === 'manual' ? 0.95 : 0.7;
+    ctx.fillStyle = ZOOM_COLOR;
+    roundRect(ctx, xa, ZOOM_Y, w, ZOOM_H, 4);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'rgba(9,9,11,0.35)';
+    const ramp = Math.min(w / 2, 0.7 * v.pxPerSec);
+    ctx.fillRect(xa, ZOOM_Y, ramp, ZOOM_H);
+    ctx.fillRect(xa + w - Math.min(w / 2, 0.8 * v.pxPerSec), ZOOM_Y, Math.min(w / 2, 0.8 * v.pxPerSec), ZOOM_H);
+    if (sel) {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      roundRect(ctx, xa, ZOOM_Y, w, ZOOM_H, 4);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+    if (w > 40) {
+      ctx.fillStyle = '#052e16';
+      ctx.fillText(`${z.scale.toFixed(1)}×${z.source === 'manual' ? ' ✎' : ''}`, xa + 5, ZOOM_Y + 14, w - 10);
+    }
+  });
+
+  // Inferred clicks: brightness = confidence.
+  for (const c of edl.clicks) {
+    if (c.t < t0 || c.t > t1) continue;
+    ctx.globalAlpha = 0.25 + 0.75 * c.confidence;
+    ctx.fillStyle = c.confidence >= 0.55 ? '#facc15' : '#a1a1aa';
+    ctx.beginPath();
+    ctx.arc(X(c.t), CLICKS_Y + CLICKS_H / 2, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
 
   if (selection?.kind === 'range') {
     ctx.fillStyle = 'rgba(139,124,255,0.25)';

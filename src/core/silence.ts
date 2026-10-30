@@ -136,6 +136,8 @@ export interface SilencePlan {
   levels: Levels;
   /** Pauses ≥ minSilenceSec, before padding. */
   longPauses: SilenceRange[];
+  /** Every detected pause (any length). */
+  pauses: SilenceRange[];
 }
 
 /** Turns long pauses into cuts (static screen) or speed-ups (busy screen). */
@@ -148,7 +150,7 @@ export function planSilenceEdits(
   const { pauses, levels } = detectPauses(audio, s.thresholdRatio);
   const cuts: Cut[] = [];
   const speedups: SpeedUp[] = [];
-  if (!s.enabled) return { cuts, speedups, levels, longPauses: [] };
+  if (!s.enabled) return { cuts, speedups, levels, longPauses: [], pauses };
 
   // Dead air at start/end: before the first speech or real action, after the last one.
   let headEnd = 0;
@@ -185,5 +187,5 @@ export function planSilenceEdits(
     }
   }
   cuts.sort((a, b) => a.start - b.start);
-  return { cuts, speedups, levels, longPauses };
+  return { cuts, speedups, levels, longPauses, pauses };
 }

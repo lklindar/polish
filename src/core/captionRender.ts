@@ -3,12 +3,14 @@
 
 import type { Caption } from './edl';
 import type { CaptionSettings } from './captions';
+import type { Circle } from './layout';
 
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
 const FONT = '600 {px}px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
 
-export function drawCaption(ctx: Ctx, cap: Caption, t: number, s: CaptionSettings, width: number, height: number) {
+/** `avoid` (in canvas px) is the webcam bubble: the caption box slides sideways or above to clear it. */
+export function drawCaption(ctx: Ctx, cap: Caption, t: number, s: CaptionSettings, width: number, height: number, avoid?: Circle | null) {
   const px = Math.round(height * s.size);
   ctx.save();
   ctx.font = FONT.replace('{px}', String(px));
@@ -21,8 +23,19 @@ export function drawCaption(ctx: Ctx, cap: Caption, t: number, s: CaptionSetting
   const padY = px * 0.38;
   const boxW = Math.max(...widths) + padX * 2;
   const boxH = lines.length * lineH + padY * 2 - (lineH - px * 1.05);
-  const x0 = (width - boxW) / 2;
-  const y0 = height - height * 0.06 - boxH;
+  let x0 = (width - boxW) / 2;
+  let y0 = height - height * 0.06 - boxH;
+  if (avoid) {
+    const gap = px * 0.6;
+    const hits = (x: number, y: number) =>
+      x < avoid.x + avoid.r + gap && avoid.x - avoid.r - gap < x + boxW && y < avoid.y + avoid.r + gap && avoid.y - avoid.r - gap < y + boxH;
+    if (hits(x0, y0)) {
+      const side = avoid.x < width / 2 ? avoid.x + avoid.r + gap : avoid.x - avoid.r - gap - boxW;
+      if (side >= gap && side + boxW <= width - gap) x0 = side;
+      else y0 = Math.max(gap, avoid.y - avoid.r - gap - boxH);
+    }
+  }
+  const shift = x0 - (width - boxW) / 2;
 
   // Fade in/out over 120 ms.
   const fade = Math.min(1, (t - cap.start) / 0.12, (cap.end - t) / 0.12);
@@ -39,7 +52,7 @@ export function drawCaption(ctx: Ctx, cap: Caption, t: number, s: CaptionSetting
   }
   let wi = 0;
   lines.forEach((ws, li) => {
-    let x = (width - widths[li]) / 2;
+    let x = (width - widths[li]) / 2 + shift;
     const y = y0 + padY + px * 0.95 + li * lineH;
     for (const w of ws) {
       ctx.fillStyle = wi === active ? '#c4b8ff' : wi < active ? '#ffffff' : 'rgba(255,255,255,0.86)';

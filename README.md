@@ -30,8 +30,8 @@ Requires current desktop Chrome or Edge (WebCodecs, OPFS). The dev server and `v
 | 1. Scaffold, import, Mediabunny decode, preview player, waveform timeline | ✅ |
 | 2. Silence detection, EDL, real-time cut preview, MP4 export (cuts only) | ✅ |
 | 3. Whisper worker, fillers (transcript + acoustic), review UI, captions | ✅ |
-| 4. Frame analysis: webcam/content rect, cursor, clicks, zoom track + WebGL renderer | next |
-| 5. Audio polish chain, music ducking, global speed | |
+| 4. Frame analysis: webcam/content rect, cursor, clicks, zoom track + WebGL renderer | ✅ |
+| 5. Audio polish chain, music ducking, global speed | next |
 | 6. One-click flow with all steps, Before/After, full edit report | partially (flow + toggle + report exist) |
 | 7. Transcript editing, chapters, vertical export, intro/outro, styling | |
 | 8. Performance pass, deploy, docs | partially (headers, README) |
@@ -67,13 +67,67 @@ Requires current desktop Chrome or Edge (WebCodecs, OPFS). The dev server and `v
    the export (toggle in Edit → Captions: chars/line, lines, size, highlight). The `.srt` always
    downloads.
 
+**M4: auto-zoom and captions on/off**
+1. **Captions on/off.** Use the **CC** button in the player bar, or the *Captions* checkbox on the
+   start screen. Off means no captions in the preview and none burned into the export. The `.srt`
+   is still offered in the export dialog.
+2. **Auto-zoom.** The **ZOOM** track shows green blocks; the darker ends are the ease-in/out. The
+   **CLICKS** track shows every inferred click; brighter yellow means more confident. Play through
+   a zoom: the app window's content zooms *inside its own frame*, the background stays put, the
+   webcam bubble stays at normal size, and the camera pans between clicks that are close together.
+3. **Edit zooms.** Drag a block to move it, drag its edges to resize, press Del to remove it (it
+   won't come back on re-plan). Press **Z** to add a zoom at the playhead. With a zoom selected,
+   click the picture to choose where it zooms. Edited zooms are marked ✎ and kept when settings
+   change.
+4. **Edit → Zoom.** Zoom level 1.3–2.5×, the click-confidence threshold, follow-cursor, motion blur
+   (pans only) and the click ripple.
+5. Captions step sideways, or above, to stay clear of the webcam bubble.
+
+**Tighter edit + speed**
+1. **Pauses:** Premium now shortens every pause from 0.35 s down to about 0.2 s (Snappy from
+   0.25 s). When an "um" is cut, the pauses on both sides of it close up too, so they don't merge
+   into one long gap. Silent-but-busy stretches (page loading, scrolling) are sped up to about
+   0.8 s, at up to 12×.
+2. **Hesitations:**
+   - Drawn-out short words ("the……", "so……", "and……") are trimmed to their first ~0.14 s.
+   - Steady "a…"/"uh…" sounds that Whisper leaves out of the transcript are cut when they sit
+     between transcribed words.
+3. **Repeated words:**
+   - Stutters ("the, the", "we can, we can") and false starts are cut automatically, at the
+     quietest point before the retake. They appear in orange on the timeline and in Review.
+   - Grammatical doubles like "that that" are only listed, not cut.
+   - Toggles: Edit → Fillers.
+4. **Speed:** use the **1×** menu in the player bar (1×, 1.1×, 1.2×, 1.25×, 1.5×, 1.75×, 2×). It
+   applies to both preview and export, and voices keep their pitch (WSOLA time-stretch in the
+   export).
+
+**Hover previews**
+- Move the mouse over the timeline to see a thumbnail of that moment (like YouTube). It shows
+  the time in the edited video and the caption being spoken. Moments that were cut appear greyed
+  out, labelled with what was removed.
+- Thumbnails (one per second, 240 px) are generated in the background after the editor opens.
+  Keyframe thumbnails come first (every ~10 s across the whole video, within seconds), then every
+  second fills in (about 45 s for 17 min, 6 MB, cached for next time). Until an exact thumbnail
+  exists, the nearest one is shown; with none at all, a hidden video seeks to the frame.
+
 ## Measured on the sample (17.6 min, 1662×1080, M-series Mac)
 
 - **Analysis:** about 95 s cold with the model cached (audio 20 s → transcription 74 s on WebGPU,
   running alongside the 45 s screen scan); 131 s including the one-time model download. 0.2 s
   when cached.
-- **Removed:** 58 s (**5.5%**): 44 silences (≈30 s) plus 81 fillers (≈27 s), and 16 busy pauses
-  sped up. This speaker barely pauses (pauses of 0.6 s or more total about 4% of the file), so
+- **Removed:** **119 s (11.3%)**, double the earlier 58 s:
+  - 189 pause trims;
+  - 104 fillers, including 9 dropped "a…" hesitations and 16 trimmed drawn-out words;
+  - 5 repeats;
+  - 26 busy pauses tightened.
+
+  The re-transcribed export was checked against the source transcript. Every real word missing
+  near a cut was inspected on the waveform, and the cut was always clear of the word.
+- **Speed 1.5×:**
+  - output exactly 1.5000× shorter (15:37 → 10:25);
+  - A/V aligned within 10 ms across the whole file;
+  - voice pitch unchanged (102.6 Hz vs 103.9 Hz);
+  - exported in 1 m 32 s. This speaker barely pauses (pauses of 0.6 s or more total about 4% of the file), so
   the 20–35% target isn't reachable on this recording without cutting speech.
 - **Fillers:** with the disfluent prompt Whisper keeps them: 79 "um"/"uh" transcribed.
   Median filler cut is 0.34 s.
@@ -90,20 +144,34 @@ Requires current desktop Chrome or Edge (WebCodecs, OPFS). The dev server and `v
   speech are re-decoded without the prompt (2 of 55 on the sample, recovering 61 words). The
   acoustic detector only flags sounds that have transcribed words on both sides, so a skipped
   passage can't be mistaken for fillers.
-- **Export:** 2 m 16 s for 16.6 min with burned-in captions. Memory flat (14–16 MB page heap).
+- **Frame analysis** (M4): 75 s for the 17.6 min file at 15 fps, half resolution. Reading the
+  decoder's luma plane directly instead of drawing to a canvas made it 2.5× faster. It runs
+  alongside transcription.
+- **Layout:** window rect found exactly (the source is already styled, so no extra frame is added).
+  The webcam bubble is tracked as it moves between bottom-left and bottom-right and changes size.
+- **Clicks vs. ground truth.** This recording draws a yellow click highlight, which gave 96 real
+  clicks to score against:
+  - 72% of real clicks get a zoom (chance level is 30%);
+  - 40 of the 81 auto zooms contain a real click;
+  - median click-position error is 4 px;
+  - no zoom points at the webcam or the background.
+
+  The main source of false zooms is hover tooltips and highlights, which pixel analysis can't
+  tell apart from click reactions. Del removes one.
+- **Export:** 2 m 16 s for 16.6 min with burned-in captions (2 m 11 s with 85 zooms). Memory flat (14–16 MB page heap).
   A/V sync exact (after compensating the AAC encoder's 2112-sample priming delay).
 
 ## Known issues
 
-- Captions are bottom-centred and can overlap the webcam bubble (sample: bottom-left). Webcam
-  detection in M4 will steer them clear.
 - Language "Auto" detects once, on the first chunk (English vs Indonesian); mixed speech is then
   decoded with that language token. Pick a language explicitly if the opening isn't typical.
 - The acoustic detector is conservative: on the sample only 2 of its candidates clear the default
   0.6 confidence; the rest are listed in Review.
-- Bright areas export about 1% darker than the source (canvas RGB round-trip). This will be fixed
-  when export moves to the WebGL renderer in M4.
+- Auto-zoom is below the 80% target on the sample (72%), and about half the auto zooms are on
+  hovers rather than clicks. Ideas to improve this: tell tooltips (dark box below the pointer) apart
+  from button reactions, and use pointer-shape templates (arrow → hand) as an extra click hint.
+- The area under the webcam bubble is never recorded. Inside a zoom it is filled by extending the
+  surrounding content outwards; this is invisible on plain UI but can show faint streaks over busy
+  content.
 - `measureUserAgentSpecificMemory` falls back to the page heap in some contexts, so the memory
   readout may not include the export worker's heap or native frame memory.
-- Global speed (1.1× / 1.25×) is implemented in the EDL and preview but not yet exposed in the UI;
-  pitch-preserving export audio lands in M5.

@@ -15,9 +15,9 @@ export function ReviewPanel() {
 
   const fillers = edl.cuts
     .map((c, index) => ({ c, index }))
-    .filter(({ c }) => c.type === 'filler')
+    .filter(({ c }) => c.type === 'filler' || c.type === 'repeat')
     .filter(({ c }) => (filter === 'all' ? true : filter === 'removed' ? c.enabled : !c.enabled));
-  const all = edl.cuts.filter((c) => c.type === 'filler');
+  const all = edl.cuts.filter((c) => c.type === 'filler' || c.type === 'repeat');
   const removed = all.filter((c) => c.enabled);
   const removedSec = removed.reduce((a, c) => a + c.end - c.start, 0);
 
@@ -30,7 +30,7 @@ export function ReviewPanel() {
     <div className="text-sm">
       <div className="p-4 border-b border-zinc-800/80">
         <div className="text-zinc-300">
-          <span className="text-yellow-400 font-medium">{removed.length}</span> of {all.length} fillers removed ·{' '}
+          <span className="text-yellow-400 font-medium">{removed.length}</span> of {all.length} fillers, repeats and held words removed ·{' '}
           {removedSec.toFixed(1)}s
         </div>
         <div className="flex gap-1 mt-2">
@@ -92,7 +92,7 @@ export function ReviewPanel() {
                 className="accent-yellow-500"
               />
               <span className="tabular-nums text-xs text-zinc-500 w-12">{fmtTime(c.start)}</span>
-              <span className={`flex-1 ${c.enabled ? 'text-zinc-200' : 'text-zinc-500'}`}>{c.label}</span>
+              <span className={`flex-1 ${c.enabled ? (c.type === 'repeat' ? 'text-orange-300' : 'text-zinc-200') : 'text-zinc-500'}`}>{c.label}</span>
               <span className="w-14 h-1.5 rounded bg-zinc-800 overflow-hidden" title={`Confidence ${Math.round((c.confidence ?? 0) * 100)}%`}>
                 <span className="block h-full bg-yellow-500/80" style={{ width: `${(c.confidence ?? 0) * 100}%` }} />
               </span>

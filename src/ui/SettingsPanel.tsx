@@ -57,6 +57,9 @@ function EditSettings() {
   };
   const sil = settings.silence;
   const fil = settings.fillers;
+  const zoomSummary = edl
+    ? `${edl.zooms.length} zooms from ${edl.clicks.filter((c) => c.confidence >= settings.zoom.minConfidence).length} of ${edl.clicks.length} detected clicks${edl.layout?.webcam.length ? ' · webcam excluded' : ''}`
+    : '';
   const transcribing = useStore((s) => s.transcribing);
   const fillers = edl?.cuts.filter((c) => c.type === 'filler') ?? [];
   const fillerSummary = edl?.transcript
@@ -119,6 +122,10 @@ function EditSettings() {
         <Slider label="Remove when confidence ≥" value={fil.minConfidence} min={0.3} max={0.95} step={0.05}
           hint={fillerSummary}
           onChange={(v) => update((s) => (s.fillers.minConfidence = v))} />
+        <Toggle label="Remove repeated words and false starts" value={fil.removeRepeats}
+          onChange={(v) => update((s) => (s.fillers.removeRepeats = v))} />
+        <Toggle label="Shorten drawn-out words (“a……”, “the……”)" value={fil.trimHeldWords}
+          onChange={(v) => update((s) => (s.fillers.trimHeldWords = v))} />
         <Toggle label="Acoustic detector (fillers Whisper skipped)" value={fil.acoustic}
           onChange={(v) => update((s) => (s.fillers.acoustic = v))} />
         <TextSetting label="Filler words" value={fil.lexicon} hint="Comma-separated. Letters may repeat: “um” also matches “ummm”."
@@ -158,7 +165,25 @@ function EditSettings() {
           onCommit={(v) => update((s) => (s.transcription.prompt = v))} />
       </Section>
 
-      <Section title="Captions" enabled={settings.captions.burnIn} onToggle={(v) => update((s) => (s.captions.burnIn = v))}>
+      <Section title="Zoom" enabled={settings.zoom.enabled} onToggle={(v) => update((s) => (s.zoom.enabled = v))}>
+        <Slider label="Zoom level" value={settings.zoom.scale} min={1.3} max={2.5} step={0.1} unit="×"
+          onChange={(v) => update((s) => (s.zoom.scale = v))} />
+        <Slider label="Zoom on clicks with confidence ≥" value={settings.zoom.minConfidence} min={0.3} max={0.9} step={0.05}
+          hint={zoomSummary}
+          onChange={(v) => update((s) => (s.zoom.minConfidence = v))} />
+        <Toggle label="Follow the cursor while zoomed" value={settings.zoom.followCursor}
+          onChange={(v) => update((s) => (s.zoom.followCursor = v))} />
+        <Toggle label="Motion blur on fast camera moves" value={settings.zoom.motionBlur}
+          onChange={(v) => update((s) => (s.zoom.motionBlur = v))} />
+        <Toggle label="Click ripple" value={settings.zoom.ripple}
+          onChange={(v) => update((s) => (s.zoom.ripple = v))} />
+        <div className="text-xs text-zinc-500">
+          Z adds a zoom at the playhead. Select a zoom, then click the picture to choose where it zooms. Drag a zoom to move it,
+          drag its edges to resize, Del to remove.
+        </div>
+      </Section>
+
+      <Section title="Captions" enabled={settings.captions.enabled} onToggle={(v) => update((s) => (s.captions.enabled = v))}>
         <Slider label="Max characters per line" value={settings.captions.maxCharsPerLine} min={20} max={60} step={1}
           onChange={(v) => update((s) => (s.captions.maxCharsPerLine = v))} />
         <Slider label="Lines" value={settings.captions.maxLines} min={1} max={2} step={1}
@@ -167,7 +192,7 @@ function EditSettings() {
           onChange={(v) => update((s) => (s.captions.size = v / 100))} />
         <Toggle label="Highlight the current word" value={settings.captions.highlightWord}
           onChange={(v) => update((s) => (s.captions.highlightWord = v))} />
-        <div className="text-xs text-zinc-500">On = burned into the video. An .srt is always exported.</div>
+        <div className="text-xs text-zinc-500">On: shown in the preview and burned into the video. Off: a clean video. The .srt is offered either way.</div>
       </Section>
 
       <Section title="Export">
@@ -187,7 +212,7 @@ function EditSettings() {
           onChange={(v) => update((s) => (s.export.bitrateMbps = v))} />
       </Section>
 
-      <div className="p-4 text-xs text-zinc-600">Zoom arrives in M4; audio polish in M5.</div>
+      <div className="p-4 text-xs text-zinc-600">Audio polish arrives in M5.</div>
     </div>
   );
 }
@@ -197,6 +222,7 @@ function SelectionCard() {
   const { selection, edl } = useStore();
   const s = useStore.getState();
   if (!selection || !edl || selection.kind === 'caption') return null;
+  if (selection.kind === 'zoom') return <ZoomCard index={selection.index} />;
   let title = '';
   let range: [number, number] = [0, 0];
   let enabled = true;
@@ -207,7 +233,7 @@ function SelectionCard() {
   } else if (selection.kind === 'cut') {
     const c = edl.cuts[selection.index];
     if (!c) return null;
-    title = c.type === 'filler' ? `Filler “${c.label}” · ${Math.round((c.confidence ?? 0) * 100)}%` : (c.label ?? c.type);
+    title = c.type === 'filler' || c.type === 'repeat' ? `${c.type === 'repeat' ? 'Repeat' : 'Filler'} “${c.label}” · ${Math.round((c.confidence ?? 0) * 100)}%` : (c.label ?? c.type);
     range = [c.start, c.end];
     enabled = c.enabled;
     action = () => s.toggleCut(selection.index);
@@ -254,6 +280,7 @@ function Legend() {
   const items: [string, string][] = [
     ['Silence', CUT_COLORS.silence],
     ['Filler', CUT_COLORS.filler],
+    ['Repeat', CUT_COLORS.repeat],
     ['Speed-up', CUT_COLORS.speedup],
     ['Dead air', CUT_COLORS.deadStartEnd],
     ['Manual', CUT_COLORS.manual],
@@ -354,5 +381,39 @@ function TextSetting(props: { label: string; value: string; hint?: string; onCom
       />
       {props.hint && <div className="text-xs text-zinc-600">{props.hint}</div>}
     </label>
+  );
+}
+
+function ZoomCard({ index }: { index: number }) {
+  const player = usePlayer();
+  const z = useStore((s) => s.edl?.zooms[index]);
+  const { updateZoom, deleteZoom, setMode } = useStore.getState();
+  if (!z) return null;
+  return (
+    <div className="m-3 p-3 rounded-lg bg-zinc-900 border border-emerald-700/50">
+      <div className="font-medium">
+        Zoom {z.source === 'manual' ? '(edited)' : '(auto)'} · {z.focus.length} focus point{z.focus.length === 1 ? '' : 's'}
+      </div>
+      <div className="text-xs text-zinc-500 tabular-nums mt-0.5">
+        {fmtTime(z.start, true)} → {fmtTime(z.end, true)} ({(z.end - z.start).toFixed(1)}s)
+      </div>
+      <Slider label="Zoom level" value={z.scale} min={1.3} max={2.5} step={0.1} unit="×"
+        onChange={(v) => updateZoom(index, { scale: v }, 'zoom-scale')} />
+      <div className="text-xs text-zinc-500 mt-1">Click the picture to set where this zoom points.</div>
+      <div className="flex gap-2 mt-2">
+        <button
+          className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-xs"
+          onClick={() => {
+            setMode('after');
+            player.playSpan(Math.max(0, z.start - 0.5), z.end + 0.3);
+          }}
+        >
+          ▶ Preview zoom
+        </button>
+        <button className="px-2 py-1 rounded bg-zinc-800 hover:bg-red-900/60 text-xs" onClick={() => deleteZoom(index)}>
+          Delete (Del)
+        </button>
+      </div>
+    </div>
   );
 }

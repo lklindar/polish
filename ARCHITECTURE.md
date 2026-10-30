@@ -71,8 +71,23 @@ acoustic detectors, waveform-based boundary refinement, retake finder), `core/ca
 Captions are derived, not stored: `transcript.words` (in the EDL) minus enabled cuts → caption
 lines. Editing a caption rewrites the words, so edits survive any re-plan.
 
-Later milestones add `core/clicks.ts`, `core/zoom.ts`, `render/gl.ts` (WebGL2 compositor for
-preview and export) and `audio/polish.ts` (RNNoise + filter chain + LUFS).
+M4 added:
+- `workers/analyzeVideo.worker.ts`: one pass at 15 fps and half resolution, reading the decoder's
+  luma plane. It emits compact per-frame summaries (`core/frameData.ts`): cursor-like
+  "became dark" blobs paired with their "became light" origin, change regions, a motion-frequency
+  grid, snapshots and a median still.
+- `core/layout.ts`: the window rect from long straight edges in the median still; the webcam
+  bubble from always-moving cells, refined to the strongest circular edge and clustered over time.
+- `core/clicks.ts`: the cursor tracker (association by "left from here" pairing, plus chained
+  re-acquisition after fast flicks) and click inference (rest ≥ 270 ms, then a reaction under or
+  near the pointer, or a page change).
+- `core/zoom.ts` and `core/compose.ts`: clicks are grouped into zoom blocks with cursor-follow
+  focus keys. The camera is a pure function of time (eased envelope, distance-scaled pans,
+  clamped to the window). `frameState` adds blur, the webcam redraw and ripples.
+- `render/compositor.ts`: a WebGL2 single pass used by **both** the preview (`<video>` texture)
+  and the export worker (`VideoFrame` texture), so what you see is what is exported.
+
+`audio/polish.ts` (RNNoise + filter chain + LUFS) arrives in M5.
 
 ## Notes on the sample file
 

@@ -4,14 +4,19 @@ import { computeActivity, type ActivityTrack, type VideoActivityRaw } from '../c
 import { detectCapabilities, type Capabilities } from '../core/capabilities';
 import { kv } from '../core/db';
 import { applyCaptionEdit, buildCaptions } from '../core/captions';
-import { emptyEdl, withSegments, type Cut, type EDL } from '../core/edl';
-import { findRepeats, planFillerCuts } from '../core/fillers';
+import { emptyEdl, withSegments, type Cut, type EDL, type ZoomBlock } from '../core/edl';
+import type { FrameData } from '../core/frameData';
+import { inferClicks, trackCursor, type CursorTrack, type InferredClick } from '../core/clicks';
+import { detectLayout, type Layout } from '../core/layout';
+import { planZooms } from '../core/zoom';
+import { closeGaps, heldWordCuts, planFillerCuts, repeatCuts } from '../core/fillers';
 import { fileKey } from '../core/hash';
 import { PRESETS, cloneSettings, type PresetId, type Settings } from '../core/settings';
 import { detectPauses, planSilenceEdits, type AudioAnalysis, type Levels } from '../core/silence';
 import { planChunks, type Transcript, type Word } from '../core/transcript';
 import type { AnalyzeAudioOut, AnalyzeVideoOut, PcmRef, SourceMeta } from '../workers/protocol';
 import type { WhisperIn, WhisperOut } from '../workers/whisper.worker';
+import type { ThumbsIn, ThumbsOut } from '../workers/thumbs.worker';
 
 export type StepStatus = 'pending' | 'running' | 'done' | 'error' | 'cached';
 export interface Step {
@@ -23,7 +28,7 @@ export interface Step {
 }
 
 const HISTORY_LIMIT = 200;
-const ANALYSIS_VERSION = 2;
+const ANALYSIS_VERSION = 7;
 const PROJECT_VERSION = 2;
 
 interface CachedAnalysis {
@@ -31,6 +36,7 @@ interface CachedAnalysis {
   meta: SourceMeta;
   audio: AudioAnalysis | null;
   activityRaw: VideoActivityRaw | null;
+  frameData: FrameData | null;
   pcm: PcmRef | null;
 }
 
@@ -46,6 +52,7 @@ export type Selection =
   | { kind: 'cut'; index: number }
   | { kind: 'speedup'; index: number }
   | { kind: 'caption'; index: number }
+  | { kind: 'zoom'; index: number }
   | { kind: 'range'; start: number; end: number }
   | null;
 
@@ -65,6 +72,10 @@ interface State {
   activity: ActivityTrack | null;
   levels: Levels | null;
   pcm: PcmRef | null;
+  /** Frame analysis results: window/webcam layout, cursor path and inferred clicks. */
+  vision: Vision | null;
+  /** Hover-preview thumbnails, one per `interval` s of source; filled in progressively. */
+  thumbs: { interval: number; blobs: (Blob | undefined)[]; ready: boolean } | null;
   /** Live words while (re)transcribing, and progress for the editor's banner. */
   transcribing: { fraction: number; detail: string; words: Word[] } | null;
 
@@ -98,13 +109,20 @@ interface State {
   applySuggestion(index: number): void;
   dismissSuggestion(index: number): void;
   retranscribe(): Promise<void>;
+  /** Adds a manual zoom at source time t (focus = last cursor position, else content centre). */
+  addZoom(t: number): void;
+  /** Edits a zoom; any edit makes it 'manual' so re-planning keeps it. */
+  updateZoom(index: number, patch: Partial<ZoomBlock>, coalesce?: string): void;
+  deleteZoom(index: number): void;
+  /** Whole-video playback speed (1×, 1.2×, 1.5× …), pitch preserved. */
+  setGlobalSpeed(speed: number): void;
 }
 
 const initialSteps = (): Step[] => [
   { id: 'probe', label: 'Reading file', status: 'pending', fraction: 0 },
   { id: 'audio', label: 'Analyzing audio', status: 'pending', fraction: 0 },
   { id: 'transcribe', label: 'Transcribing', status: 'pending', fraction: 0 },
-  { id: 'video', label: 'Scanning screen activity', status: 'pending', fraction: 0 },
+  { id: 'video', label: 'Finding clicks', status: 'pending', fraction: 0 },
   { id: 'build', label: 'Building edit', status: 'pending', fraction: 0 },
 ];
 
@@ -156,6 +174,30 @@ function runWorker<TOut extends { type: string }>(
   });
 }
 
+/** Fills settings added in later versions (and renamed fields) from the Premium defaults. */
+function migrateSettings(s: Settings): Settings {
+  const d = PRESETS.premium.settings;
+  const out = cloneSettings(d);
+  for (const k of Object.keys(d) as (keyof Settings)[]) Object.assign(out[k], s[k] ?? {});
+  const legacy = s.captions as Settings['captions'] & { burnIn?: boolean };
+  if (legacy && legacy.enabled === undefined && legacy.burnIn !== undefined) out.captions.enabled = legacy.burnIn;
+  delete (out.captions as { burnIn?: boolean }).burnIn;
+  return out;
+}
+
+export interface Vision {
+  layout: Layout;
+  track: CursorTrack;
+  clicks: InferredClick[];
+}
+
+function analyzeVision(fd: FrameData | null): Vision | null {
+  if (!fd) return null;
+  const layout = detectLayout(fd);
+  const track = trackCursor(fd, layout);
+  return { layout, track, clicks: inferClicks(fd, layout, track) };
+}
+
 /** Recomputes everything derived from cuts: segments and captions. */
 function finalize(edl: EDL, settings: Settings): EDL {
   const withSegs = withSegments(edl);
@@ -164,11 +206,17 @@ function finalize(edl: EDL, settings: Settings): EDL {
 }
 
 /** Regenerates auto cuts from analysis + settings, keeping manual cuts and the user's toggles. */
-function planEdl(base: EDL, audio: AudioAnalysis | null, activity: ActivityTrack | null, settings: Settings) {
+function planEdl(base: EDL, audio: AudioAnalysis | null, activity: ActivityTrack | null, settings: Settings, vision: Vision | null) {
+  base = planVision(base, settings, vision);
   if (!audio) return { edl: finalize(base, settings), levels: null };
   const plan = planSilenceEdits(audio, activity, settings.silence);
   const words = base.transcript?.words ?? [];
-  const fillers = planFillerCuts(audio, plan.levels, words, settings.fillers);
+  const fs = settings.fillers;
+  const baseFillers = planFillerCuts(audio, plan.levels, words, fs);
+  const held = fs.enabled && fs.trimHeldWords && words.length ? heldWordCuts(words, audio) : [];
+  const repeats = fs.removeRepeats && words.length ? repeatCuts(words, audio, baseFillers) : [];
+  // Close the pauses around removed fillers/repeats so they don't join into one long gap.
+  const fillers = closeGaps([...baseFillers, ...held, ...repeats], plan.pauses, settings.silence.paddingSec);
   const overlaps = (a: Cut, b: Cut) =>
     a.type === b.type && Math.min(a.end, b.end) - Math.max(a.start, b.start) > 0.5 * Math.min(a.end - a.start, b.end - b.start);
   const userSet = base.cuts.filter((c) => c.userSet && c.type !== 'manual');
@@ -180,9 +228,27 @@ function planEdl(base: EDL, audio: AudioAnalysis | null, activity: ActivityTrack
     .map(remember)
     .concat(base.cuts.filter((c) => c.type === 'manual'))
     .sort((a, b) => a.start - b.start);
-  const suggestions = findRepeats(words, fillers.filter((c) => c.enabled));
+  // Retakes are cut (as 'repeat' cuts) now; nothing left to suggest separately.
+  const suggestions: { start: number; end: number; text: string }[] = [];
   const edl = finalize({ ...base, cuts, speedups: plan.speedups, suggestions }, settings);
   return { edl, levels: plan.levels };
+}
+
+/** Auto zooms from clicks; zooms the user created or edited (source 'manual') are kept. */
+function planVision(base: EDL, settings: Settings, vision: Vision | null): EDL {
+  if (!vision) return base;
+  const manual = base.zooms.filter((z) => z.source === 'manual');
+  const dismissed = base.dismissedZooms ?? [];
+  const overlaps = (a: { start: number; end: number }, b: { start: number; end: number }) => a.start < b.end && b.start < a.end;
+  const auto = planZooms(vision.clicks, vision.track, vision.layout.content, settings.zoom).filter(
+    (z) => !manual.some((m) => overlaps(m, z)) && !dismissed.some((d) => overlaps(d, z)),
+  );
+  return {
+    ...base,
+    layout: vision.layout,
+    clicks: vision.clicks.map((c) => ({ t: c.t, x: c.x, y: c.y, confidence: c.confidence, reason: c.reason })),
+    zooms: [...manual, ...auto].sort((a, b) => a.start - b.start),
+  };
 }
 
 const transcriptKey = (key: string, t: Settings['transcription']) =>
@@ -254,6 +320,44 @@ function transcribe(
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let thumbWorker: Worker | null = null;
+
+const THUMB_INTERVAL = 1;
+const THUMB_WIDTH = 240;
+
+/** Hover previews: from the cache, or generated in the background (progressively) and cached. */
+async function loadThumbnails(key: string, file: File) {
+  const cacheKey = `thumbs:v1:${key}`;
+  const cached = await kv.get<{ interval: number; blobs: Blob[] }>(cacheKey);
+  if (useStore.getState().key !== key) return;
+  if (cached) {
+    useStore.setState({ thumbs: { interval: cached.interval, blobs: cached.blobs, ready: true } });
+    return;
+  }
+  thumbWorker?.terminate();
+  const w = new Worker(new URL('../workers/thumbs.worker.ts', import.meta.url), { type: 'module' });
+  thumbWorker = w;
+  const blobs: (Blob | undefined)[] = [];
+  useStore.setState({ thumbs: { interval: THUMB_INTERVAL, blobs, ready: false } });
+  w.onmessage = (e: MessageEvent<ThumbsOut>) => {
+    const m = e.data;
+    if (useStore.getState().key !== key) return w.terminate();
+    if (m.type === 'batch') {
+      blobs.length = Math.max(blobs.length, m.total);
+      m.blobs.forEach((b, i) => (blobs[m.indices[i]] = b));
+      useStore.setState({ thumbs: { interval: THUMB_INTERVAL, blobs: blobs.slice(), ready: false } });
+    } else if (m.type === 'done') {
+      useStore.setState({ thumbs: { interval: THUMB_INTERVAL, blobs: blobs.slice(), ready: true } });
+      void kv.set(cacheKey, { interval: THUMB_INTERVAL, blobs });
+      w.terminate();
+      thumbWorker = null;
+    } else {
+      console.warn('[thumbs]', m.message);
+      w.terminate();
+    }
+  };
+  w.postMessage({ file, interval: THUMB_INTERVAL, width: THUMB_WIDTH } satisfies ThumbsIn);
+}
 let lastCommit: { tag?: string; at: number } = { at: 0 };
 
 export const useStore = create<State>((set, get) => ({
@@ -271,6 +375,8 @@ export const useStore = create<State>((set, get) => ({
   activity: null,
   levels: null,
   pcm: null,
+  vision: null,
+  thumbs: null,
   transcribing: null,
   presetId: 'premium',
   settings: cloneSettings(PRESETS.premium.settings),
@@ -309,6 +415,7 @@ export const useStore = create<State>((set, get) => ({
       if (cached?.v !== ANALYSIS_VERSION || (cached.audio && !(await pcmExists(cached.pcm)))) cached = undefined;
       let audio = cached?.audio ?? null;
       let activityRaw = cached?.activityRaw ?? null;
+      let frameData = cached?.frameData ?? null;
       let pcm = cached?.pcm ?? null;
       const settings = get().settings;
       const tKey = transcriptKey(key, settings.transcription);
@@ -360,14 +467,16 @@ export const useStore = create<State>((set, get) => ({
           (f) => step('video', { fraction: f }),
         ).then((r) => {
           step('video', { status: 'done', fraction: 1 });
+          frameData = r.frameData;
           return r.activity;
         });
         [transcript, activityRaw] = await Promise.all([audioThenText, videoP]);
-        await kv.set(`analysis:${key}`, { v: ANALYSIS_VERSION, meta, audio, activityRaw, pcm } satisfies CachedAnalysis);
+        await kv.set(`analysis:${key}`, { v: ANALYSIS_VERSION, meta, audio, activityRaw, frameData, pcm } satisfies CachedAnalysis);
       }
 
       step('build', { status: 'running' });
       const activity = activityRaw ? computeActivity(activityRaw) : null;
+      const vision = analyzeVision(frameData);
       const saved = await kv.get<SavedProject>(`project:${key}`);
       let edl: EDL;
       let levels: Levels | null = null;
@@ -375,12 +484,13 @@ export const useStore = create<State>((set, get) => ({
       if (saved?.edl && saved.v === PROJECT_VERSION) {
         edl = saved.edl;
         restoredProject = true;
-        set({ settings: saved.settings, presetId: saved.presetId });
-        levels = planEdl(edl, audio, activity, saved.settings).levels;
+        const restored = migrateSettings(saved.settings);
+        set({ settings: restored, presetId: saved.presetId });
+        levels = planEdl(edl, audio, activity, restored, vision).levels;
       } else {
         const base = emptyEdl({ durationSec: meta.durationSec, width: meta.width, height: meta.height, fps: meta.fps });
         if (transcript) base.transcript = transcript;
-        ({ edl, levels } = planEdl(base, audio, activity, get().settings));
+        ({ edl, levels } = planEdl(base, audio, activity, get().settings, vision));
       }
       step('build', { status: 'done', fraction: 1 });
       set({
@@ -388,6 +498,7 @@ export const useStore = create<State>((set, get) => ({
         activity,
         levels,
         pcm,
+        vision,
         edl,
         past: [],
         future: [],
@@ -396,6 +507,7 @@ export const useStore = create<State>((set, get) => ({
         restoredProject,
         analysisMs: performance.now() - t0,
       });
+      void loadThumbnails(key, file);
     } catch (err) {
       set((s) => ({
         error: String((err as Error)?.message ?? err),
@@ -405,6 +517,8 @@ export const useStore = create<State>((set, get) => ({
   },
 
   reset() {
+    thumbWorker?.terminate();
+    thumbWorker = null;
     const old = get().fileUrl;
     if (old) URL.revokeObjectURL(old);
     set({
@@ -417,6 +531,8 @@ export const useStore = create<State>((set, get) => ({
       audio: null,
       activity: null,
       pcm: null,
+      vision: null,
+      thumbs: null,
       transcribing: null,
       past: [],
       future: [],
@@ -456,16 +572,19 @@ export const useStore = create<State>((set, get) => ({
   setSettings(settings, presetId = 'custom') {
     const prev = get().settings;
     const changed = (k: keyof Settings) => JSON.stringify(settings[k]) !== JSON.stringify(prev[k]);
+    // Caption on/off is a display choice; only layout changes re-split the caption lines.
+    const captionLayoutChanged =
+      JSON.stringify({ ...settings.captions, enabled: true }) !== JSON.stringify({ ...prev.captions, enabled: true });
     set({ settings, presetId });
     if (changed('transcription')) void get().retranscribe();
-    else if (changed('silence') || changed('fillers') || changed('captions')) get().rebuildEdit();
+    else if (changed('silence') || changed('fillers') || changed('zoom') || captionLayoutChanged) get().rebuildEdit();
     else scheduleSave();
   },
 
   rebuildEdit() {
-    const { edl, audio, activity, settings } = get();
+    const { edl, audio, activity, settings, vision } = get();
     if (!edl) return;
-    const { edl: next, levels } = planEdl(edl, audio, activity, settings);
+    const { edl: next, levels } = planEdl(edl, audio, activity, settings, vision);
     set({ levels, selection: null });
     get().commit(next, 'settings');
   },
@@ -513,13 +632,14 @@ export const useStore = create<State>((set, get) => ({
         set({ selection: null });
       } else get().toggleCut(selection.index);
     } else if (selection.kind === 'speedup') get().toggleSpeedup(selection.index);
+    else if (selection.kind === 'zoom') get().deleteZoom(selection.index);
   },
 
   importProject(json) {
     const data = JSON.parse(json) as Partial<SavedProject>;
     if (!data.edl?.segments || !data.edl.source) throw new Error('Not a Polish project file.');
     if (data.v !== PROJECT_VERSION) throw new Error('This project file is from an older version of Polish.');
-    if (data.settings) set({ settings: data.settings, presetId: data.presetId ?? 'custom' });
+    if (data.settings) set({ settings: migrateSettings(data.settings), presetId: data.presetId ?? 'custom' });
     get().commit(finalize(data.edl, get().settings));
   },
 
@@ -547,6 +667,53 @@ export const useStore = create<State>((set, get) => ({
     get().commit({ ...edl, suggestions: edl.suggestions.filter((_, i) => i !== index) });
   },
 
+  addZoom(t) {
+    const { edl, settings, vision } = get();
+    if (!edl) return;
+    const content = edl.layout?.content ?? { x: 0, y: 0, w: edl.source.width, h: edl.source.height };
+    let x = content.x + content.w / 2;
+    let y = content.y + content.h / 2;
+    if (vision) {
+      const f = Math.min(vision.track.x.length - 1, Math.round(t * vision.track.fps));
+      if (!Number.isNaN(vision.track.x[f])) {
+        x = vision.track.x[f];
+        y = vision.track.y[f];
+      }
+    }
+    const start = Math.max(0, t - 0.3);
+    // Don't overlap neighbours: trim to the gap the playhead is in.
+    const next = edl.zooms.find((z) => z.start > t);
+    const end = Math.min(start + 2.5, next ? next.start : Infinity);
+    if (edl.zooms.some((z) => t >= z.start && t < z.end) || end - start < 1) return;
+    const zoom: ZoomBlock = { start, end, scale: settings.zoom.scale, focus: [{ t: start, x, y }], source: 'manual' };
+    const zooms = [...edl.zooms, zoom].sort((a, b) => a.start - b.start);
+    get().commit({ ...edl, zooms });
+    set({ selection: { kind: 'zoom', index: zooms.indexOf(zoom) } });
+  },
+
+  updateZoom(index, patch, coalesce) {
+    const { edl } = get();
+    const z = edl?.zooms[index];
+    if (!edl || !z) return;
+    const zooms = edl.zooms.map((x, i) => (i === index ? { ...x, ...patch, source: 'manual' as const } : x));
+    get().commit({ ...edl, zooms }, coalesce);
+  },
+
+  setGlobalSpeed(speed) {
+    const { edl } = get();
+    if (!edl || edl.globalSpeed === speed) return;
+    get().commit({ ...edl, globalSpeed: speed });
+  },
+
+  deleteZoom(index) {
+    const { edl } = get();
+    const z = edl?.zooms[index];
+    if (!edl || !z) return;
+    const dismissedZooms = z.source === 'auto' ? [...(edl.dismissedZooms ?? []), { start: z.start, end: z.end }] : edl.dismissedZooms;
+    get().commit({ ...edl, zooms: edl.zooms.filter((_, i) => i !== index), dismissedZooms });
+    set({ selection: null });
+  },
+
   async retranscribe() {
     const { key, pcm, audio, meta, settings, caps } = get();
     if (!key || !pcm || !audio || !meta || get().transcribing) return;
@@ -561,7 +728,7 @@ export const useStore = create<State>((set, get) => ({
         await kv.set(tKey, t);
       }
       const edl = get().edl!;
-      const { edl: next, levels } = planEdl({ ...edl, transcript: t }, audio, get().activity, get().settings);
+      const { edl: next, levels } = planEdl({ ...edl, transcript: t }, audio, get().activity, get().settings, get().vision);
       set({ levels });
       get().commit(next);
     } catch (err) {

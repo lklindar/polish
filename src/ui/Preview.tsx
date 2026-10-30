@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
 import { outputDuration, segmentIndexAt, srcToOut } from '../core/edl';
 import { fmtTime } from '../core/format';
+import { viewport } from '../core/zoom';
 import { useStore } from '../state/store';
 import { usePlayer, usePlaying } from './playerContext';
 
@@ -31,7 +32,7 @@ export function Preview() {
       if (timeRef.current) {
         timeRef.current.textContent = before
           ? `${fmtTime(t, true)} / ${fmtTime(useStore.getState().edl!.source.durationSec)}`
-          : `${fmtTime(srcToOut(segs, t), true)} / ${fmtTime(outputDuration(segs))}`;
+          : `${fmtTime(srcToOut(segs, t, useStore.getState().edl!.globalSpeed), true)} / ${fmtTime(outputDuration(segs, useStore.getState().edl!.globalSpeed))}`;
       }
       if (badgeRef.current) {
         const seg = before ? undefined : segs[segmentIndexAt(segs, t)];
@@ -51,7 +52,26 @@ export function Preview() {
         <div className="relative" style={{ width: fit.w, height: fit.h }}>
           <canvas
             ref={canvasRef}
-            onClick={() => player.toggle()}
+            onClick={(e) => {
+              // With a zoom selected, clicking the picture sets where it zooms to.
+              const { selection, edl: cur, updateZoom } = useStore.getState();
+              if (selection?.kind === 'zoom' && cur) {
+                const r = e.currentTarget.getBoundingClientRect();
+                const sx = ((e.clientX - r.left) / r.width) * cur.source.width;
+                const sy = ((e.clientY - r.top) / r.height) * cur.source.height;
+                const content = cur.layout?.content ?? { x: 0, y: 0, w: cur.source.width, h: cur.source.height };
+                // The picture may be zoomed right now: map back through the current camera.
+                const cam = player.compose?.(player.srcTime)?.camera ?? { scale: 1, cx: 0, cy: 0 };
+                const v = viewport(cam, content);
+                const inContent = sx >= content.x && sx <= content.x + content.w && sy >= content.y && sy <= content.y + content.h;
+                const x = cam.scale > 1.001 && inContent ? v.x + (sx - content.x) / cam.scale : sx;
+                const y = cam.scale > 1.001 && inContent ? v.y + (sy - content.y) / cam.scale : sy;
+                const z = cur.zooms[selection.index];
+                updateZoom(selection.index, { focus: [{ t: z.start, x, y }] });
+                return;
+              }
+              player.toggle();
+            }}
             className="h-full w-full rounded-lg shadow-2xl shadow-black/60 bg-black cursor-pointer"
           />
           <div
@@ -65,7 +85,7 @@ export function Preview() {
           )}
         </div>
       </div>
-      <div className="h-11 shrink-0 flex items-center gap-3 px-4 border-t border-zinc-800/80">
+      <div className="h-11 shrink-0 flex items-center gap-3 px-4 border-t border-zinc-800/80 min-w-0 overflow-hidden">
         <button
           onClick={() => player.seek(Math.max(0, player.srcTime - 5))}
           className="text-zinc-400 hover:text-white text-sm"
@@ -80,8 +100,10 @@ export function Preview() {
         >
           {playing ? '❚❚' : '▶'}
         </button>
-        <span ref={timeRef} className="text-sm tabular-nums text-zinc-300 min-w-[11rem]" />
-        <span className="ml-auto text-xs text-zinc-500">Space play · J/K/L shuttle · Del cut selection · ⌘Z undo</span>
+        <CaptionToggle />
+        <SpeedMenu />
+        <span ref={timeRef} className="text-sm tabular-nums text-zinc-300 whitespace-nowrap" />
+        <span className="ml-auto text-xs text-zinc-500 truncate hidden xl:block">Space play · J/K/L shuttle · Z zoom · Del delete/cut · ⌘Z undo</span>
       </div>
     </div>
   );
@@ -103,4 +125,48 @@ function useFit(ref: RefObject<HTMLElement | null>, aspect: number, pad: number)
     return () => ro.disconnect();
   }, [ref, aspect, pad]);
   return fit;
+}
+
+/** Captions on/off. Off = nothing in the preview and nothing burned into the export. */
+export function CaptionToggle() {
+  const enabled = useStore((s) => s.settings.captions.enabled);
+  const hasCaptions = useStore((s) => (s.edl?.captions.length ?? 0) > 0);
+  const toggle = () => {
+    const { settings, presetId, setSettings } = useStore.getState();
+    setSettings({ ...settings, captions: { ...settings.captions, enabled: !enabled } }, presetId);
+  };
+  return (
+    <button
+      onClick={toggle}
+      title={enabled ? 'Captions on: click to turn them off' : 'Captions off: click to turn them on'}
+      aria-pressed={enabled}
+      className={`px-1.5 py-0.5 rounded text-[11px] font-bold tracking-wide border transition ${
+        enabled ? 'border-white bg-white text-zinc-900' : 'border-zinc-600 text-zinc-500 hover:text-zinc-300'
+      } ${hasCaptions ? '' : 'opacity-50'}`}
+    >
+      CC
+    </button>
+  );
+}
+
+const SPEEDS = [1, 1.1, 1.2, 1.25, 1.5, 1.75, 2];
+
+/** Whole-video speed. Applies to preview and export; voices keep their pitch. */
+export function SpeedMenu() {
+  const speed = useStore((s) => s.edl?.globalSpeed ?? 1);
+  const setGlobalSpeed = useStore((s) => s.setGlobalSpeed);
+  return (
+    <select
+      value={speed}
+      onChange={(e) => setGlobalSpeed(Number(e.target.value))}
+      title="Video speed (voices keep their pitch)"
+      className={`rounded border px-1 py-0.5 text-[11px] font-bold bg-zinc-900 ${speed !== 1 ? 'border-white text-white' : 'border-zinc-600 text-zinc-400'}`}
+    >
+      {SPEEDS.map((v) => (
+        <option key={v} value={v}>
+          {v}×
+        </option>
+      ))}
+    </select>
+  );
 }

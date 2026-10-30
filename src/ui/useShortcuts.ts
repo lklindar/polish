@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { useStore } from '../state/store';
 import { usePlayer } from './playerContext';
 
-/** Space play/pause · J/K/L shuttle · ←/→ ±1 s · Del cut/toggle selection · ⌘Z / ⇧⌘Z undo/redo. */
+/** Space play/pause · J/K/L shuttle · ←/→ ±1 s · Z add zoom · Del cut/toggle/delete selection · ⌘Z / ⇧⌘Z undo/redo. */
 export function useShortcuts() {
   const player = usePlayer();
   useEffect(() => {
@@ -52,6 +52,9 @@ export function useShortcuts() {
         case 'Backspace':
           e.preventDefault();
           s.deleteSelection();
+          break;
+        case 'z':
+          s.addZoom(player.srcTime);
           break;
         case 'Escape':
           s.setSelection(null);

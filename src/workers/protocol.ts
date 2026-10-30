@@ -1,8 +1,10 @@
 import type { VideoActivityRaw } from '../core/activity';
+import type { FrameData } from '../core/frameData';
 import type { AudioAnalysis } from '../core/silence';
 import type { EDL } from '../core/edl';
 import type { ExportSettings } from '../core/settings';
 import type { CaptionSettings } from '../core/captions';
+import type { ZoomSettings } from '../core/zoom';
 
 export interface SourceMeta {
   durationSec: number;
@@ -33,7 +35,7 @@ export interface PcmRef {
 
 export type AnalyzeVideoOut =
   | { type: 'progress'; fraction: number }
-  | { type: 'done'; activity: VideoActivityRaw }
+  | { type: 'done'; activity: VideoActivityRaw; frameData: FrameData }
   | { type: 'error'; message: string };
 
 export interface ExportIn {
@@ -44,6 +46,7 @@ export interface ExportIn {
   fileName: string;
   /** Captions to burn in (source time), or null for none. */
   captionStyle: CaptionSettings | null;
+  zoom: ZoomSettings;
 }
 
 export type ExportOut =
